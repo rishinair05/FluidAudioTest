@@ -66,7 +66,7 @@ struct PlaybackView: View {
                 }
             }
             
-            NavigationLink(destination: TranscriptView(memo: memo)) {
+            NavigationLink(destination: TranscriptView(viewModel: viewModel, memo: memo)) {
                 Text("View Transcript")
             }
             .padding()

@@ -1,16 +1,21 @@
 import Foundation
 import AVFoundation
 import SwiftUI
+import FluidAudio
 
 class VoiceMemoViewModel: ObservableObject {
     @Published var voiceMemos: [VoiceMemo] = []
     @Published var isRecording = false
     @Published var isPlaying = false
     @Published var currentMemo: VoiceMemo?
+    @Published var isTranscribing = false
     
     private var audioRecorder: AVAudioRecorder?
     private var audioPlayer: AVAudioPlayer?
     private var recordingSession: AVAudioSession
+    
+    // FluidAudio ASR components (lazy-initialized on first transcription)
+    private var asrManager: AsrManager?
     
     private var documentsDirectory: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -116,10 +121,41 @@ class VoiceMemoViewModel: ObservableObject {
     }
 
     func transcribe(memo: VoiceMemo) {
-        // Placeholder for transcription logic
-        if let index = voiceMemos.firstIndex(where: { $0.id == memo.id }) {
-            voiceMemos[index].transcript = "This is a placeholder transcript."
-            saveMemos()
+        // Kick off an async transcription using FluidAudio.
+        isTranscribing = true
+        Task {
+            do {
+                // Initialize FluidAudio ASR once and reuse
+                if asrManager == nil {
+                    let models = try await AsrModels.downloadAndLoad()
+                    let manager = AsrManager(config: .default)
+                    try await manager.initialize(models: models)
+                    asrManager = manager
+                }
+                guard let asrManager else { throw NSError(domain: "VoiceMemoViewModel", code: -1, userInfo: [NSLocalizedDescriptionKey: "ASR manager unavailable"]) }
+
+                // Load and convert audio to Float32 mono 16kHz samples using AVAudioConverter
+                let samples = try self.loadSamples16kMono(url: memo.url)
+
+                // Transcribe
+                let result = try await asrManager.transcribe(samples, source: .system)
+
+                await MainActor.run {
+                    if let index = self.voiceMemos.firstIndex(where: { $0.id == memo.id }) {
+                        self.voiceMemos[index].transcript = result.text
+                        self.saveMemos()
+                    }
+                    self.isTranscribing = false
+                }
+            } catch {
+                await MainActor.run {
+                    if let index = self.voiceMemos.firstIndex(where: { $0.id == memo.id }) {
+                        self.voiceMemos[index].transcript = "Transcription failed: \(error.localizedDescription)"
+                        self.saveMemos()
+                    }
+                    self.isTranscribing = false
+                }
+            }
         }
     }
     
@@ -163,5 +199,70 @@ class VoiceMemoViewModel: ObservableObject {
             let transcript = item.count > 4 ? item[4] as? String : nil
             return VoiceMemo(id: id, title: title, date: Date(timeIntervalSince1970: date), url: url, transcript: transcript)
         }
+    }
+
+    // MARK: - Audio Utilities
+
+    /// Load an audio file and convert it to 16kHz mono Float32 samples
+    private func loadSamples16kMono(url: URL) throws -> [Float] {
+        let file = try AVAudioFile(forReading: url)
+        let srcFormat = file.processingFormat
+        let totalFrames = AVAudioFrameCount(file.length)
+
+        // Fast path: already 16kHz mono Float32
+        if srcFormat.sampleRate == 16000,
+           srcFormat.commonFormat == .pcmFormatFloat32,
+           srcFormat.channelCount == 1 {
+            guard let buf = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: totalFrames) else {
+                throw NSError(domain: "VoiceMemoViewModel", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate buffer"])
+            }
+            try file.read(into: buf)
+            guard let data = buf.floatChannelData else { return [] }
+            let count = Int(buf.frameLength)
+            return Array(UnsafeBufferPointer(start: data[0], count: count))
+        }
+
+        // Convert to 16kHz mono Float32
+        let targetFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16000,
+            channels: 1,
+            interleaved: false
+        )!
+
+        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: totalFrames) else {
+            throw NSError(domain: "VoiceMemoViewModel", code: -4, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate source buffer"])
+        }
+        try file.read(into: srcBuffer)
+
+        // Estimate destination capacity conservatively
+        let estimatedDstFrames = AVAudioFrameCount(Double(totalFrames) * targetFormat.sampleRate / max(1.0, srcFormat.sampleRate) + 1)
+        guard let dstBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: estimatedDstFrames) else {
+            throw NSError(domain: "VoiceMemoViewModel", code: -5, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate destination buffer"])
+        }
+
+        guard let converter = AVAudioConverter(from: srcFormat, to: targetFormat) else {
+            throw NSError(domain: "VoiceMemoViewModel", code: -6, userInfo: [NSLocalizedDescriptionKey: "Failed to create audio converter"])
+        }
+
+        var isConsumed = false
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+            if isConsumed {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            outStatus.pointee = .haveData
+            isConsumed = true
+            return srcBuffer
+        }
+
+        var convError: NSError?
+        _ = converter.convert(to: dstBuffer, error: &convError, withInputFrom: inputBlock)
+        if let convError = convError { throw convError }
+
+        // Extract mono float samples from destination buffer
+        guard let dstData = dstBuffer.floatChannelData else { return [] }
+        let outCount = Int(dstBuffer.frameLength)
+        return Array(UnsafeBufferPointer(start: dstData[0], count: outCount))
     }
 }
