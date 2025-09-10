@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import SwiftUI
 import FluidAudio
+import Darwin
 
 class VoiceMemoViewModel: ObservableObject {
     @Published var voiceMemos: [VoiceMemo] = []
@@ -9,6 +10,7 @@ class VoiceMemoViewModel: ObservableObject {
     @Published var isPlaying = false
     @Published var currentMemo: VoiceMemo?
     @Published var isTranscribing = false
+    @Published var transcriptionStats: [UUID: TranscriptionStats] = [:]
     
     private var audioRecorder: AVAudioRecorder?
     private var audioPlayer: AVAudioPlayer?
@@ -125,11 +127,17 @@ class VoiceMemoViewModel: ObservableObject {
         isTranscribing = true
         Task {
             do {
-                // Initialize FluidAudio ASR once and reuse
+                // Initialize FluidAudio ASR once and reuse; measure model load/initialize time
+                var modelLoadSeconds: TimeInterval = 0
+                var initializeSeconds: TimeInterval = 0
                 if asrManager == nil {
+                    let loadStart = Date()
                     let models = try await AsrModels.downloadAndLoad()
+                    modelLoadSeconds = Date().timeIntervalSince(loadStart)
                     let manager = AsrManager(config: .default)
+                    let initStart = Date()
                     try await manager.initialize(models: models)
+                    initializeSeconds = Date().timeIntervalSince(initStart)
                     asrManager = manager
                 }
                 guard let asrManager else { throw NSError(domain: "VoiceMemoViewModel", code: -1, userInfo: [NSLocalizedDescriptionKey: "ASR manager unavailable"]) }
@@ -137,14 +145,50 @@ class VoiceMemoViewModel: ObservableObject {
                 // Load and convert audio to Float32 mono 16kHz samples using AVAudioConverter
                 let samples = try self.loadSamples16kMono(url: memo.url)
 
-                // Transcribe
+                // Transcribe with CPU/memory measurement
+                let (cpuUserBefore, cpuSysBefore) = self.processCPUTimeSeconds()
+                let memBefore = self.currentResidentMemoryBytes()
+                let transStart = Date()
                 let result = try await asrManager.transcribe(samples, source: .system)
+                let transWallSeconds = Date().timeIntervalSince(transStart)
+                let (cpuUserAfter, cpuSysAfter) = self.processCPUTimeSeconds()
+                let memAfter = self.currentResidentMemoryBytes()
+                let cpuUserDelta = max(0, cpuUserAfter - cpuUserBefore)
+                let cpuSysDelta = max(0, cpuSysAfter - cpuSysBefore)
+                let cpuTotalDelta = cpuUserDelta + cpuSysDelta
+
+                // Derive token count and throughput
+                let tokenCount: Int
+                if let timings = result.tokenTimings, !timings.isEmpty {
+                    tokenCount = timings.count
+                } else {
+                    // Fallback: approximate tokens as words
+                    tokenCount = result.text.split{ $0.isWhitespace }.count
+                }
+                let processingSeconds = result.processingTime > 0 ? result.processingTime : transWallSeconds
+                let tokensPerSecond = processingSeconds > 0 ? Double(tokenCount) / processingSeconds : 0
+                let rtf = processingSeconds > 0 ? (result.duration / processingSeconds) : 0
 
                 await MainActor.run {
                     if let index = self.voiceMemos.firstIndex(where: { $0.id == memo.id }) {
                         self.voiceMemos[index].transcript = result.text
                         self.saveMemos()
                     }
+                    // Save stats for display
+                    self.transcriptionStats[memo.id] = TranscriptionStats(
+                        modelLoadSeconds: modelLoadSeconds,
+                        initializeSeconds: initializeSeconds,
+                        transcriptionSeconds: processingSeconds,
+                        audioDurationSeconds: result.duration,
+                        realTimeFactor: rtf,
+                        tokenCount: tokenCount,
+                        tokensPerSecond: tokensPerSecond,
+                        cpuUserSeconds: cpuUserDelta,
+                        cpuSystemSeconds: cpuSysDelta,
+                        cpuTotalSeconds: cpuTotalDelta,
+                        memoryResidentBeforeBytes: memBefore,
+                        memoryResidentAfterBytes: memAfter
+                    )
                     self.isTranscribing = false
                 }
             } catch {
@@ -156,6 +200,46 @@ class VoiceMemoViewModel: ObservableObject {
                     self.isTranscribing = false
                 }
             }
+        }
+    }
+
+    // Stats model to render in UI
+    struct TranscriptionStats {
+        let modelLoadSeconds: TimeInterval
+        let initializeSeconds: TimeInterval
+        let transcriptionSeconds: TimeInterval
+        let audioDurationSeconds: TimeInterval
+        let realTimeFactor: Double
+        let tokenCount: Int
+        let tokensPerSecond: Double
+        let cpuUserSeconds: TimeInterval
+        let cpuSystemSeconds: TimeInterval
+        let cpuTotalSeconds: TimeInterval
+        let memoryResidentBeforeBytes: UInt64
+        let memoryResidentAfterBytes: UInt64
+    }
+
+    // MARK: - Resource measurement helpers
+    private func processCPUTimeSeconds() -> (user: TimeInterval, system: TimeInterval) {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        let user = TimeInterval(usage.ru_utime.tv_sec) + TimeInterval(usage.ru_utime.tv_usec) / 1_000_000
+        let sys = TimeInterval(usage.ru_stime.tv_sec) + TimeInterval(usage.ru_stime.tv_usec) / 1_000_000
+        return (user, sys)
+    }
+
+    private func currentResidentMemoryBytes() -> UInt64 {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+        let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        if kerr == KERN_SUCCESS {
+            return UInt64(info.resident_size)
+        } else {
+            return 0
         }
     }
     
