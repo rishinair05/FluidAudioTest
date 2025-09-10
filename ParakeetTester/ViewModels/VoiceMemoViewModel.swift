@@ -114,6 +114,14 @@ class VoiceMemoViewModel: ObservableObject {
             saveMemos()
         }
     }
+
+    func transcribe(memo: VoiceMemo) {
+        // Placeholder for transcription logic
+        if let index = voiceMemos.firstIndex(where: { $0.id == memo.id }) {
+            voiceMemos[index].transcript = "This is a placeholder transcript."
+            saveMemos()
+        }
+    }
     
     func importAudio(url: URL) {
         let shouldStopAccessing = url.startAccessingSecurityScopedResource()
@@ -137,7 +145,7 @@ class VoiceMemoViewModel: ObservableObject {
     }
     
     private func saveMemos() {
-        let memos = voiceMemos.map { [$0.id.uuidString, $0.title, $0.date.timeIntervalSince1970, $0.url.absoluteString] }
+        let memos = voiceMemos.map { [$0.id.uuidString, $0.title, $0.date.timeIntervalSince1970, $0.url.absoluteString, $0.transcript ?? ""] }
         UserDefaults.standard.set(memos, forKey: "voiceMemos")
     }
     
@@ -152,7 +160,8 @@ class VoiceMemoViewModel: ObservableObject {
                   let url = URL(string: urlString) else {
                 return nil
             }
-            return VoiceMemo(id: id, title: title, date: Date(timeIntervalSince1970: date), url: url)
+            let transcript = item.count > 4 ? item[4] as? String : nil
+            return VoiceMemo(id: id, title: title, date: Date(timeIntervalSince1970: date), url: url, transcript: transcript)
         }
     }
 }

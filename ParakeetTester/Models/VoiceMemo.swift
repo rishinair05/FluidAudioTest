@@ -6,4 +6,5 @@ struct VoiceMemo: Identifiable, Equatable {
     var title: String
     let date: Date
     let url: URL
+    var transcript: String?
 }

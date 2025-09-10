@@ -65,6 +65,11 @@ struct PlaybackView: View {
                         .font(.largeTitle)
                 }
             }
+            
+            NavigationLink(destination: TranscriptView(memo: memo)) {
+                Text("View Transcript")
+            }
+            .padding()
         }
         .onAppear(perform: setupAudio)
         .onDisappear(perform: {
