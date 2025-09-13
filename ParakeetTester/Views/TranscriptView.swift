@@ -1,9 +1,20 @@
 
 import SwiftUI
+import NaturalLanguage
 
 struct TranscriptView: View {
     @ObservedObject var viewModel: VoiceMemoViewModel
     let memo: VoiceMemo
+
+    private var transcriptText: String {
+        viewModel.voiceMemos.first(where: { $0.id == memo.id })?.transcript
+            ?? memo.transcript
+            ?? "No transcript available."
+    }
+
+    private var transcriptSentences: [String] {
+        sentenceSplit(transcriptText)
+    }
 
     var body: some View {
         VStack {
@@ -16,8 +27,26 @@ struct TranscriptView: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text(viewModel.voiceMemos.first(where: { $0.id == memo.id })?.transcript ?? memo.transcript ?? "No transcript available.")
-                    
+                    VStack(alignment: .leading, spacing: 10) {
+                        if let perSentence = viewModel.sentenceTimestamps[memo.id], !perSentence.isEmpty {
+                            ForEach(perSentence) { item in
+                                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                    Text(timeString(item.startTime))
+                                        .font(.caption)
+                                        .monospacedDigit()
+                                        .foregroundStyle(.secondary)
+                                        .frame(width: 64, alignment: .leading)
+                                    Text(item.sentence)
+                                        .multilineTextAlignment(.leading)
+                                }
+                            }
+                        } else {
+                            ForEach(Array(transcriptSentences.enumerated()), id: \.0) { _, sentence in
+                                Text(sentence)
+                            }
+                        }
+                    }
+
                     Divider()
                     if let stats = viewModel.transcriptionStats[memo.id] {
                         VStack(alignment: .leading, spacing: 8) {
@@ -49,6 +78,19 @@ struct TranscriptView: View {
     }
 
     // MARK: - Formatting helpers
+    private func sentenceSplit(_ text: String) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = trimmed
+        var sentences: [String] = []
+        tokenizer.enumerateTokens(in: trimmed.startIndex..<trimmed.endIndex) { range, _ in
+            let s = String(trimmed[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !s.isEmpty { sentences.append(s) }
+            return true
+        }
+        return sentences
+    }
     private func statRow(_ label: String, _ value: String) -> some View {
         HStack {
             Text(label)
@@ -75,5 +117,11 @@ struct TranscriptView: View {
             unitIndex += 1
         }
         return String(format: unitIndex == 0 ? "%.0f %@" : "%.2f %@", value, units[unitIndex])
+    }
+
+    private func timeString(_ time: TimeInterval) -> String {
+        let minutes = Int(time) / 60
+        let seconds = Int(time) % 60
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }

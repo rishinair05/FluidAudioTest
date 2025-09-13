@@ -13,6 +13,18 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             VStack {
+                // Engine picker
+                HStack {
+                    Text("Engine")
+                    Spacer()
+                    Picker("Engine", selection: $viewModel.engine) {
+                        Text("Parakeet").tag(VoiceMemoViewModel.TranscriptionEngine.parakeet)
+                        Text("Apple").tag(VoiceMemoViewModel.TranscriptionEngine.apple)
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 260)
+                }
+                .padding([.horizontal, .top])
                 List {
                     ForEach(viewModel.voiceMemos) { memo in
                         NavigationLink(destination: PlaybackView(viewModel: viewModel, memo: memo)) {

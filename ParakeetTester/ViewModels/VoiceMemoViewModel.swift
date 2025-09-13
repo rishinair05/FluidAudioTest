@@ -3,14 +3,25 @@ import AVFoundation
 import SwiftUI
 import FluidAudio
 import Darwin
+import NaturalLanguage
+import Speech
 
 class VoiceMemoViewModel: ObservableObject {
+    enum TranscriptionEngine: String, CaseIterable, Identifiable {
+        case parakeet
+        case apple
+        var id: String { rawValue }
+        var displayName: String { self == .parakeet ? "Parakeet" : "Apple" }
+    }
+
     @Published var voiceMemos: [VoiceMemo] = []
     @Published var isRecording = false
     @Published var isPlaying = false
     @Published var currentMemo: VoiceMemo?
     @Published var isTranscribing = false
     @Published var transcriptionStats: [UUID: TranscriptionStats] = [:]
+    @Published var sentenceTimestamps: [UUID: [SentenceTimestamp]] = [:]
+    @Published var engine: TranscriptionEngine = .parakeet
     
     private var audioRecorder: AVAudioRecorder?
     private var audioPlayer: AVAudioPlayer?
@@ -101,6 +112,17 @@ class VoiceMemoViewModel: ObservableObject {
             return nil
         }
     }
+
+    func seek(to time: TimeInterval, memo: VoiceMemo) {
+        if audioPlayer == nil || currentMemo != memo {
+            _ = createPlayback(memo: memo)
+            currentMemo = memo
+        }
+        audioPlayer?.currentTime = max(0, time)
+        audioPlayer?.prepareToPlay()
+        audioPlayer?.play()
+        isPlaying = true
+    }
     
     func deleteMemo(at offsets: IndexSet) {
         offsets.forEach { index in
@@ -127,69 +149,11 @@ class VoiceMemoViewModel: ObservableObject {
         isTranscribing = true
         Task {
             do {
-                // Initialize FluidAudio ASR once and reuse; measure model load/initialize time
-                var modelLoadSeconds: TimeInterval = 0
-                var initializeSeconds: TimeInterval = 0
-                if asrManager == nil {
-                    let loadStart = Date()
-                    let models = try await AsrModels.downloadAndLoad()
-                    modelLoadSeconds = Date().timeIntervalSince(loadStart)
-                    let manager = AsrManager(config: .default)
-                    let initStart = Date()
-                    try await manager.initialize(models: models)
-                    initializeSeconds = Date().timeIntervalSince(initStart)
-                    asrManager = manager
-                }
-                guard let asrManager else { throw NSError(domain: "VoiceMemoViewModel", code: -1, userInfo: [NSLocalizedDescriptionKey: "ASR manager unavailable"]) }
-
-                // Load and convert audio to Float32 mono 16kHz samples using AVAudioConverter
-                let samples = try self.loadSamples16kMono(url: memo.url)
-
-                // Transcribe with CPU/memory measurement
-                let (cpuUserBefore, cpuSysBefore) = self.processCPUTimeSeconds()
-                let memBefore = self.currentResidentMemoryBytes()
-                let transStart = Date()
-                let result = try await asrManager.transcribe(samples, source: .system)
-                let transWallSeconds = Date().timeIntervalSince(transStart)
-                let (cpuUserAfter, cpuSysAfter) = self.processCPUTimeSeconds()
-                let memAfter = self.currentResidentMemoryBytes()
-                let cpuUserDelta = max(0, cpuUserAfter - cpuUserBefore)
-                let cpuSysDelta = max(0, cpuSysAfter - cpuSysBefore)
-                let cpuTotalDelta = cpuUserDelta + cpuSysDelta
-
-                // Derive token count and throughput
-                let tokenCount: Int
-                if let timings = result.tokenTimings, !timings.isEmpty {
-                    tokenCount = timings.count
-                } else {
-                    // Fallback: approximate tokens as words
-                    tokenCount = result.text.split{ $0.isWhitespace }.count
-                }
-                let processingSeconds = result.processingTime > 0 ? result.processingTime : transWallSeconds
-                let tokensPerSecond = processingSeconds > 0 ? Double(tokenCount) / processingSeconds : 0
-                let rtf = processingSeconds > 0 ? (result.duration / processingSeconds) : 0
-
-                await MainActor.run {
-                    if let index = self.voiceMemos.firstIndex(where: { $0.id == memo.id }) {
-                        self.voiceMemos[index].transcript = result.text
-                        self.saveMemos()
-                    }
-                    // Save stats for display
-                    self.transcriptionStats[memo.id] = TranscriptionStats(
-                        modelLoadSeconds: modelLoadSeconds,
-                        initializeSeconds: initializeSeconds,
-                        transcriptionSeconds: processingSeconds,
-                        audioDurationSeconds: result.duration,
-                        realTimeFactor: rtf,
-                        tokenCount: tokenCount,
-                        tokensPerSecond: tokensPerSecond,
-                        cpuUserSeconds: cpuUserDelta,
-                        cpuSystemSeconds: cpuSysDelta,
-                        cpuTotalSeconds: cpuTotalDelta,
-                        memoryResidentBeforeBytes: memBefore,
-                        memoryResidentAfterBytes: memAfter
-                    )
-                    self.isTranscribing = false
+                switch engine {
+                case .parakeet:
+                    try await self.transcribeWithParakeet(memo: memo)
+                case .apple:
+                    try await self.transcribeWithSpeechTranscriber(memo: memo)
                 }
             } catch {
                 await MainActor.run {
@@ -200,6 +164,190 @@ class VoiceMemoViewModel: ObservableObject {
                     self.isTranscribing = false
                 }
             }
+        }
+    }
+
+    private func transcribeWithSpeechTranscriber(memo: VoiceMemo) async throws {
+
+        // Metrics
+        let (cpuUserBefore, cpuSysBefore) = self.processCPUTimeSeconds()
+        let memBefore = self.currentResidentMemoryBytes()
+        let start = Date()
+
+        // Configure a general-purpose transcriber; ignore timestamps/attributes for now
+        let transcriber = SpeechTranscriber(
+            locale: Locale(identifier: "en_US"),
+            transcriptionOptions: [],
+            reportingOptions: [],
+            attributeOptions: []
+        )
+
+        let analyzer = SpeechAnalyzer(modules: [transcriber])
+        let (stream, continuation) = AsyncStream<AnalyzerInput>.makeStream()
+
+        // Start analyzer and feed a single 16-bit PCM buffer of the whole file
+        try await analyzer.start(inputSequence: stream)
+
+        let audioFile = try AVAudioFile(forReading: memo.url)
+    let srcFormat = audioFile.processingFormat
+    let totalFrames = AVAudioFrameCount(audioFile.length)
+    let audioDuration: TimeInterval = Double(audioFile.length) / audioFile.fileFormat.sampleRate
+
+        guard let srcBuffer = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: totalFrames) else {
+            throw NSError(domain: "VoiceMemoViewModel", code: -30, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate source buffer for Apple transcription"])
+        }
+        try audioFile.read(into: srcBuffer)
+
+    // Target: 16-bit signed integer PCM, 16kHz mono interleaved
+    guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: true) else {
+            throw NSError(domain: "VoiceMemoViewModel", code: -31, userInfo: [NSLocalizedDescriptionKey: "Failed to create target audio format (Int16)"])
+        }
+        guard let converter = AVAudioConverter(from: srcFormat, to: targetFormat) else {
+            throw NSError(domain: "VoiceMemoViewModel", code: -32, userInfo: [NSLocalizedDescriptionKey: "Failed to create audio converter (to Int16)"])
+        }
+
+        // Estimate destination frames (same sample rate, so same frames)
+        guard let dstBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: totalFrames) else {
+            throw NSError(domain: "VoiceMemoViewModel", code: -33, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate destination buffer (Int16)"])
+        }
+
+        var didSupply = false
+        let inputBlock: AVAudioConverterInputBlock = { _, outStatus in
+            if didSupply {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            didSupply = true
+            outStatus.pointee = .haveData
+            return srcBuffer
+        }
+
+        var convError: NSError?
+        _ = converter.convert(to: dstBuffer, error: &convError, withInputFrom: inputBlock)
+        if let convError = convError { throw convError }
+
+        continuation.yield(AnalyzerInput(buffer: dstBuffer))
+        continuation.finish()
+
+        try await analyzer.finalizeAndFinishThroughEndOfInput()
+
+        // Collect final best result
+        var finalAttributed = AttributedString("")
+        for try await result in transcriber.results {
+            if !finalAttributed.characters.isEmpty { finalAttributed.append(AttributedString(" ")) }
+            finalAttributed += result.text
+        }
+        let text = String(finalAttributed.characters)
+
+        let end = Date()
+        let (cpuUserAfter, cpuSysAfter) = self.processCPUTimeSeconds()
+        let memAfter = self.currentResidentMemoryBytes()
+
+        let cpuUserDelta = max(0, cpuUserAfter - cpuUserBefore)
+        let cpuSysDelta = max(0, cpuSysAfter - cpuSysBefore)
+        let cpuTotalDelta = cpuUserDelta + cpuSysDelta
+        let processingSeconds = end.timeIntervalSince(start)
+    let tokenCount = max(1, text.split{ $0.isWhitespace }.count)
+    let tokensPerSecond: Double = processingSeconds > 0 ? Double(tokenCount) / processingSeconds : 0.0
+    let rtf: Double = 0.0
+
+        await MainActor.run {
+            if let index = self.voiceMemos.firstIndex(where: { $0.id == memo.id }) {
+                self.voiceMemos[index].transcript = text
+                self.saveMemos()
+            }
+            // Skip timestamps per request
+            self.transcriptionStats[memo.id] = TranscriptionStats(
+                modelLoadSeconds: 0,
+                initializeSeconds: 0,
+                transcriptionSeconds: processingSeconds,
+                audioDurationSeconds: audioDuration,
+                realTimeFactor: rtf,
+                tokenCount: tokenCount,
+                tokensPerSecond: tokensPerSecond,
+                cpuUserSeconds: cpuUserDelta,
+                cpuSystemSeconds: cpuSysDelta,
+                cpuTotalSeconds: cpuTotalDelta,
+                memoryResidentBeforeBytes: memBefore,
+                memoryResidentAfterBytes: memAfter
+            )
+            self.isTranscribing = false
+        }
+    }
+
+    // MARK: - Parakeet path factored out
+    private func transcribeWithParakeet(memo: VoiceMemo) async throws {
+        // Initialize FluidAudio ASR once and reuse; measure model load/initialize time
+        var modelLoadSeconds: TimeInterval = 0
+        var initializeSeconds: TimeInterval = 0
+        if asrManager == nil {
+            let loadStart = Date()
+            let models = try await AsrModels.downloadAndLoad()
+            modelLoadSeconds = Date().timeIntervalSince(loadStart)
+            let manager = AsrManager(config: .default)
+            let initStart = Date()
+            try await manager.initialize(models: models)
+            initializeSeconds = Date().timeIntervalSince(initStart)
+            asrManager = manager
+        }
+        guard let asrManager else { throw NSError(domain: "VoiceMemoViewModel", code: -1, userInfo: [NSLocalizedDescriptionKey: "ASR manager unavailable"]) }
+
+        // Load and convert audio to Float32 mono 16kHz samples using AVAudioConverter
+        let samples = try self.loadSamples16kMono(url: memo.url)
+
+        // Transcribe with CPU/memory measurement
+        let (cpuUserBefore, cpuSysBefore) = self.processCPUTimeSeconds()
+        let memBefore = self.currentResidentMemoryBytes()
+        let transStart = Date()
+        let result = try await asrManager.transcribe(samples, source: .system)
+        let transWallSeconds = Date().timeIntervalSince(transStart)
+        let (cpuUserAfter, cpuSysAfter) = self.processCPUTimeSeconds()
+        let memAfter = self.currentResidentMemoryBytes()
+        let cpuUserDelta = max(0, cpuUserAfter - cpuUserBefore)
+        let cpuSysDelta = max(0, cpuSysAfter - cpuSysBefore)
+        let cpuTotalDelta = cpuUserDelta + cpuSysDelta
+
+        // Derive token count and throughput
+        let tokenCount: Int
+        if let timings = result.tokenTimings, !timings.isEmpty {
+            tokenCount = timings.count
+        } else {
+            // Fallback: approximate tokens as words
+            tokenCount = result.text.split{ $0.isWhitespace }.count
+        }
+        let processingSeconds = result.processingTime > 0 ? result.processingTime : transWallSeconds
+        let tokensPerSecond = processingSeconds > 0 ? Double(tokenCount) / processingSeconds : 0
+        let rtf = processingSeconds > 0 ? (result.duration / processingSeconds) : 0
+
+        await MainActor.run {
+            if let index = self.voiceMemos.firstIndex(where: { $0.id == memo.id }) {
+                self.voiceMemos[index].transcript = result.text
+                self.saveMemos()
+            }
+            // Compute sentence-level timestamps if token timings are available
+            if let timings = result.tokenTimings, !timings.isEmpty {
+                self.sentenceTimestamps[memo.id] = self.computeSentenceTimestamps(
+                    text: result.text,
+                    tokenTimings: timings,
+                    audioDuration: result.duration
+                )
+            }
+            // Save stats for display
+            self.transcriptionStats[memo.id] = TranscriptionStats(
+                modelLoadSeconds: modelLoadSeconds,
+                initializeSeconds: initializeSeconds,
+                transcriptionSeconds: processingSeconds,
+                audioDurationSeconds: result.duration,
+                realTimeFactor: rtf,
+                tokenCount: tokenCount,
+                tokensPerSecond: tokensPerSecond,
+                cpuUserSeconds: cpuUserDelta,
+                cpuSystemSeconds: cpuSysDelta,
+                cpuTotalSeconds: cpuTotalDelta,
+                memoryResidentBeforeBytes: memBefore,
+                memoryResidentAfterBytes: memAfter
+            )
+            self.isTranscribing = false
         }
     }
 
@@ -217,6 +365,88 @@ class VoiceMemoViewModel: ObservableObject {
         let cpuTotalSeconds: TimeInterval
         let memoryResidentBeforeBytes: UInt64
         let memoryResidentAfterBytes: UInt64
+    }
+
+    // MARK: - Sentence timestamps from token timings
+    struct SentenceTimestamp: Identifiable {
+        let id = UUID()
+        let sentence: String
+        let startTime: TimeInterval
+    }
+
+    private func computeSentenceTimestamps(
+        text: String,
+        tokenTimings: [TokenTiming],
+        audioDuration: TimeInterval
+    ) -> [SentenceTimestamp] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        // Sentence ranges
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = trimmed
+        var sentenceRanges: [Range<String.Index>] = []
+        tokenizer.enumerateTokens(in: trimmed.startIndex..<trimmed.endIndex) { range, _ in
+            sentenceRanges.append(range)
+            return true
+        }
+
+        // Align tokens to text indices (skip whitespace in text)
+        // tokenTimings tokens are subword pieces without ▁; we match characters ignoring spaces
+        var tokenStartIndices: [Int] = Array(repeating: 0, count: tokenTimings.count)
+        let textChars = Array(trimmed)
+        var textIdx = 0
+        for (i, tok) in tokenTimings.enumerated() {
+            let tokenChars = Array(tok.token)
+            var tokenStartedAt = -1
+
+            var j = 0
+            while j < tokenChars.count && textIdx < textChars.count {
+                // Skip whitespace in text
+                while textIdx < textChars.count && textChars[textIdx].isWhitespace { textIdx += 1 }
+                if textIdx >= textChars.count { break }
+                let cText = textChars[textIdx].lowercased()
+                let cTok = String(tokenChars[j]).lowercased()
+                if cText == cTok {
+                    if tokenStartedAt == -1 {
+                        tokenStartedAt = textIdx
+                    }
+                    textIdx += 1
+                    j += 1
+                } else {
+                    // If mismatch (punctuation or normalization), advance text index
+                    textIdx += 1
+                }
+            }
+            tokenStartIndices[i] = max(0, tokenStartedAt)
+        }
+
+        // Build sentence timestamps using first token that falls within the sentence
+        var results: [SentenceTimestamp] = []
+        for range in sentenceRanges {
+            let startOffset = trimmed.distance(from: trimmed.startIndex, to: range.lowerBound)
+            let endOffset = trimmed.distance(from: trimmed.startIndex, to: range.upperBound)
+            // Find first token whose mapped start lies within this sentence
+            var startTime: TimeInterval? = nil
+            for (idx, start) in tokenStartIndices.enumerated() {
+                if start >= startOffset && start < endOffset {
+                    startTime = tokenTimings[idx].startTime
+                    break
+                }
+            }
+
+            let sentence = String(trimmed[range]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if let ts = startTime {
+                results.append(SentenceTimestamp(sentence: sentence, startTime: ts))
+            } else {
+                // Fallback: approximate by proportional position in audio
+                let fraction = Double(startOffset) / max(1.0, Double(textChars.count))
+                let approx = fraction * audioDuration
+                results.append(SentenceTimestamp(sentence: sentence, startTime: approx))
+            }
+        }
+
+        return results
     }
 
     // MARK: - Resource measurement helpers
